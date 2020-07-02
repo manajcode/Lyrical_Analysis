@@ -1,0 +1,411 @@
+---
+title: 'LDA analysis of ALbum lyrics'
+author: "Michael Najarro"
+date: "6/6/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# *Objective*
+
+Here I use as a coding guide Julia Silge and David Robinson's **Text Mining with R A Tidy Approach** to perform an LDA analysis of lyrical content between four albums from unrelated genres of music.
+I rely on the chapter 6.2 **The great library heist**
+
+I downloaded all musical lyrics from the websitre Genius using the genius app.
+
+
+# *Introduction*
+
+Suppose a vandal broke into my study and tore apart four books. Each book contained the lyrics of each song of the following albums:
+
+    "Love as a Weapon" by Darkest Hour
+    
+    "The Payback" by James Brown
+    
+    "Continuum" by John Meyer
+    
+    "The Lonesome Crowded West" by Modest Mouse
+
+Will it be possible to arrange the album books back together? How will I know which songs belong to which albums?
+
+# *Analysis*
+
+## step 1: load libraries
+
+```{r load_libraries}
+library(pacman)
+p_load(tidyverse,
+       magrittr,
+       tidytext,
+       genius,
+       tm,
+       stringr,
+       scales,
+       topicmodels,
+       tinytex
+       )
+```
+
+## step 2: Obtain digital copies of the books.
+
+We'll retrieve the four albums and their lyrics using the Genius package. 
+
+```{r pull_data}
+#2.a) create a list of the album titles and bands
+band <- c("Darkest Hour", "James Brown", "John Mayer", "Modest Mouse")
+
+albums <-c("The Human Romance", "The Payback", "Continuum", "The lonesome Crowded West") 
+
+#2.b) get albums
+dh <- genius_album(artist = "Darkest Hour", album = "The Human Romance")
+
+jb <- genius_album(artist = "James Brown", album = "The Payback")
+jm <- genius_album(artist = "John Mayer", album = "Continuum")
+
+mm <- genius_album(artist = "Modest Mouse", album = "The lonesome Crowded West")
+```
+
+
+## step 3: Create a new data frame where all song info is combined, and titles are connected to their album (aka book-chapters)
+
+In the example provided in the book, the authors thought of each chapter that was torn out of a book as a document. In my example, each track from a lyrics book is considered a document.
+
+Since genius already provides "track_n", we can think of that as the chapter count. So I need to add an additional column per "book", the name of the album, and then combine the album name with the track count.
+
+```{r clean_data}
+#3.a) 
+dh <- dh %>%
+  mutate(album = rep("The Human Romance", nrow(dh))) %>%
+  select(album, track_n, track_title, line, lyric) %>%
+  mutate(track_n = as.character(track_n)) %>%
+  unite(album_track, c(album, track_n), sep = "-")
+
+jb <-  jb %>%
+  mutate(album = rep("The Payback", nrow(jb))) %>%
+  select(album, track_n, track_title, line, lyric) %>%
+  mutate(track_n = as.character(track_n)) %>%
+  unite(album_track, c(album, track_n), sep = "-")
+
+jm <- jm %>%
+  mutate(album = rep("Continuum", nrow(jm))) %>%
+  select(album, track_n, track_title, line, lyric) %>%
+  mutate(track_n = as.character(track_n)) %>%
+  unite(album_track, c(album, track_n), sep = "-")
+
+mm <- mm %>%
+  mutate(album = rep("TLCW", nrow(mm))) %>%
+  select(album, track_n, track_title, line, lyric) %>%
+  mutate(track_n = as.character(track_n)) %>%
+  unite(album_track, c(album, track_n), sep = "-")
+
+#3.b) now rbind all dataframes together.
+by_song <- rbind(dh,jb,jm,mm)
+saveRDS(by_song, file="./bysong.rds")
+#by_song <- readRDS(file="./bysong.rds")
+```
+
+
+## step 4: Now untidy the data and get a count of each word that is within each album-track combination.
+
+```{r wordcounts_per_song}
+# 4.a) untidy the data; 1 word per row.
+by_song_word <- by_song %>%
+  unnest_tokens(word, lyric)
+
+#4.b) find document-word counts
+word_counts <- by_song_word %>%
+  # remove stop words
+  anti_join(stop_words) %>%
+  #now count the frequency of each word per song.
+  count(album_track, word, sort = TRUE) %>%
+  ungroup()
+
+word_counts
+```
+
+
+## 6.2.1 LDA on the tracks
+
+### step 5. Create a document term matrix from the word-count data to prepare for LDA.
+
+Right now the data frame word_counts is in a tidy form with one-term from an album per row, but the topicmodels package requires a DocumentTermMatrix.
+
+As described in Chapter 5.2, we can cast a one-token-per-row table into a DocumentTermMatrix with tidytext’s cast_dtm().
+
+```{r create_dtm}
+# create a document term matrix from the tidy data
+songs_dtm <- word_counts %>%
+cast_dtm(album_track, word, n)
+
+songs_dtm
+```
+
+
+### step 6: Apply the LDA model and estimate the number of topics you have.
+
+I use the LDA() function to implement the LDA algorithm. Since there are four lyrical books that were destroyed, I will look for four topics because there are four books.
+
+Note that this is an unsupervised classification model. Each topic represents the theme of one of the four albums and thus is a blind approach to classifying words and tracks to albums.
+
+```{r track_lda}
+track_lda <- LDA(songs_dtm, k = 4, control = list(seed = 1234))
+track_lda
+
+```
+
+
+### step 7. Estimate your beta probabilities.
+
+Beta is the probability of a word belonging to specific topic. In this case we want to discover the probability that a word from a track belongs to any one of the topics.
+
+```{r Pbetas_on_words}
+track_topics <- tidy(track_lda, matrix = "beta")
+track_topics
+```
+
+The model is now in a one-topic-per-term-per-row format. For each combination, the model computes the probability of that term being generated from that topic.
+
+
+### step 8: Identify the top 5 words per topic that have the highest beta scores to get a sense for each topic's meaning.
+
+We could use dplyr’s top_n() to find the top 5 terms within each topic.
+
+```{r}
+#8.a) get the top 5 highest scored beta terms per topic.
+top_terms <- track_topics %>%
+  group_by(topic) %>%
+  top_n(5, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+
+#8.b) plot the 5 graphs
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+```
+
+Analysis of the four graphs:
+
+Realize that each topic represents a theme indicative of one album, and by coercion, an Album.
+
+Topic 1 appears ambiguous. The words waiting, world, love, and change belong to John Mayer's album Continuum, while the words highway and bleed belong to the The Lonesome Crowded West (TLCW). Further trouble arises in that words from Continuum overlap with The Human Romance.
+ 
+```{r topic_1}
+by_song_word %>%
+  filter(word %in% c("waiting","world", "bleed", "love", "highways", "change")) %>%
+  count(album_track, word, sort = TRUE) %>%
+  arrange(album_track, word, n)
+```
+
+Topic 2's words da, la, ba, and suffering come from The Payback album. The word yeah is overly represented in both the payback and TLCW. Given that topic two has the highest beta scores,it is likely that the words are representative of the lyrical content and themes of a typical James Brown song, which typically include many skat words.
+
+```{r topic_2}
+by_song_word %>%
+  filter(word %in% c("da","la", "ba", "suffering", "yeah")) %>%
+  count(album_track, word, sort = TRUE) %>%
+  arrange(album_track, word, n)
+```
+
+Word choice for topic 3 is ambiguous. The word real, which is most represented in track 2 of The Payback, has the largest beta score, indicating that it is most representative of topic 3. The problem here is that the words ooh and cowboy come from Continuum and TLCW. 
+
+```{r topic_3}
+by_song_word %>%
+  filter(word %in% c("real","payback", "uh", "cowboy", "ooh")) %>%
+  count(album_track, word, sort = TRUE) %>%
+  arrange(album_track, word, n)
+```
+
+Topic 4 is also ambiguous. The words ice and nice are well represented in the TLCW, but shoot and shot come from The Payback.
+
+```{r topic_4}
+by_song_word %>%
+  filter(word %in% c("nice","shot", "heart", "ice", "shoot")) %>%
+  count(album_track, word, sort = TRUE) %>%
+  arrange(album_track, word, n)
+```
+
+
+## 6.2.2 Per-document classification
+
+Each document in this analysis represents a single track from one album. Thus, what is the classification topic per each track? IN discovering these topics, can we correctly group tracks together based on topic to recreate the proper lyrical books, or albums?
+
+We can find the topics of each track by examining the per-track-per-topic probabilities, or gamma.
+
+
+### step 9: calculate gamma values.
+
+Recall that gamma is the probability that the words of a given document (or just think of an entire document) come from a specific topic. So in this case, the probability of a song coming from a topic.
+
+```{r calc_gamma}
+chapters_gamma <- tidy(track_lda, matrix = "gamma")
+chapters_gamma
+```
+
+Now that we have these topic probabilities, we can see how well the LDA model performed in distinguishing the four albums. We’d expect that the tracks within each album should be found to be mostly (or entirely), generated from the corresponding topic.
+
+
+### step 10: re-separate album title and track.
+
+First we re-separate the document name into title and chapter.
+
+```{r resep_album_and_track}
+chapters_gamma <- chapters_gamma %>%
+  separate(document, c("album", "track"), sep = "-", convert = TRUE)
+
+chapters_gamma
+```
+
+
+### step 11: Now create box plots of the distributions of each track's gamma score in relation to each topic.
+
+We can visualize the per-document-per-topic probability for each (Figure 6.5).
+
+```{r track-topic-album_classification}
+chapters_gamma %>%
+  mutate(title = reorder(album, gamma)) %>%
+  ggplot(aes(factor(topic), gamma)) +
+  geom_boxplot() +
+  facet_wrap(~ title)
+```
+
+Interpretation:
+
+Based on gamma scores, the unsupervised LDA model fails to adequately predict which tracks belong to their proper documents, and thus their proper albums.
+
+A great number of songs classified into topic one could belong to either Continuum, The Human Romance, or TLCW. However, given that the median value of topic 1 for Continuum is near a probability of 1, it is likely that these songs belong to topic 1 and thus Continuum.
+
+The songs grouped into topic 2 could be classified into The Payback or The human Romance; Given the wider distribution of gamma values in The Human Romance, I conclude that topic 2 is the album The Human Romance.
+
+The songs grouped into topic 3 most likely belong to the album the payback.
+
+Topic 4 is ambiguous; It could be either The Payback, The Human Romance, or TLCW.
+
+Clearly, the unsupervised LDA model was not able to accurately classify the tracks into their respective albums accurately. Thsi is likely due to the beta scores, where the words for each song were not unique enough to be found in any one album. 
+
+What are the cases where a topic most associated with a track belonged to another album?
+
+
+## step 12: Identify the songs that overlap between topics by identifying frequency (top n) of of tracks.
+
+First we’d find the topic that was most associated with each track using top_n(), which is effectively the “classification” of that track.
+
+```{r misclassified_songs}
+# 12.a) get your track classification by obtaining the highest
+# gamma scored tracks per album.
+track_classifications <- chapters_gamma %>%
+  group_by(album, track) %>%
+  top_n(1, gamma) %>%
+  ungroup()
+
+#12.b) Identify what LDA predicts the topic to album
+# relationship is. The idea here is you count up the 
+# number of high gamma scored songs per album per topic.
+# the album and topic combinations of highest score
+# represent the "consensus" of which album the topic
+# represents.
+book_topics <- track_classifications %>%
+  count(album,topic) %>%
+  group_by(album) %>%
+  top_n(1, n) %>%
+  ungroup() %>%
+  transmute(consensus = album, topic)
+
+#12.c) now inner join the the consensus outcomes with
+# the step 11 dataframe book topics and pull out the rows
+#where the consensus and the true album name do not match.
+track_classifications %>%
+  inner_join(book_topics, by = "topic") %>%
+  filter(album != consensus)
+```
+
+As we can see, many tracks from Continuum are being mixed up with the other albums.
+
+
+## 6.2.3 By word assignments: augment
+
+ One step of the LDA algorithm is assigning each word in each document to a topic. In this example, The more words in a track that are assigned to a topic, generally, the more weight (gamma) will go on that album-topic classification.
+
+We may want to take the original track-word pairs and find which words in each track were assigned to which topic. This is the job of the augment() function, which also originated in the broom package as a way of tidying model output. While tidy() retrieves the statistical components of the model, augment() uses a model to add information to each observation in the original data.
+
+### step 13: Use the augment package to identify the estimated topic that a word is classified into.
+
+```{r track-album_topic_assign}
+assignments <- augment(track_lda, data = songs_dtm)
+assignments
+```
+
+This returns a tidy data frame of book-term counts, but adds an extra column: .topic, with the topic each term was assigned to within each document. (Extra columns added by augment always start with ., to prevent overwriting existing columns).
+
+
+## step 14. Inner join the information of step 13 with the predicted album titles (the consensus) and check if the predicted album titles match the predicted topic.
+
+We can combine the assignments table of step 13 with the consensus album titles from step 9 to find which words were incorrectly classified. We should see that the true album name should match the predicted album name, and that the predict topic number should be the same for each album-predicted album combination of the model classified correctly.
+
+```{r assign_match_consensus}
+assignments <- assignments %>%
+  separate(document, c("album", "track"), sep = "-", convert = TRUE) %>%
+  inner_join(book_topics, by = c(".topic" = "topic"))
+
+assignments
+```
+
+Clearly, there are many misclassifications. 3,269 tracks were not classified properly.
+
+This combination of the true album and the album assigned to it (consensus) is useful for further exploration of misclassifications.
+
+
+## step 15. Create a mosaic plot to evaluate the percent of correct classification of words between their true album and the model's predicted album. 
+
+We can visualize a confusion matrix, showing how often words from one album were assigned to another, using dplyr’s count() and ggplot2’s geom_tile.
+
+```{r mosiac_plot}
+library(scales)
+
+assignments %>%
+  count(album, consensus, wt = count) %>%
+  group_by(album) %>%
+  mutate(percent = n / sum(n)) %>%
+  ggplot(aes(consensus, album, fill = percent)) +
+  geom_tile() +
+  scale_fill_gradient2(high = "red", label = percent_format()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(x = "Album words were assigned to",
+       y = "Album words came from",
+       fill = "% of assignments")
+```
+
+Words from The Payback were most accurately classified to the proper album. Accuracy measures for words from other albums were extremely low, below 50%.
+
+
+## step 16: Now identify the mis-classified words among the misclassified tracks.
+
+What were the most commonly mistaken words?
+
+```{r misclassified_words}
+wrong_words <- assignments %>%
+  filter(album != consensus)
+
+wrong_words
+```
+
+There were many words that were miscclassified. The most frequently misclassified words are the words that appeared in the bar graphs for beta measures for each topic. Notice that the the consensus album for the first few 20 words tended to be The Human Romance.
+
+```{r}
+wrong_words %>%
+  count(album, consensus, term, wt = count) %>%
+  ungroup() %>%
+  arrange(desc(n))
+```
+
+# *Conclusion*
+
+My LDA analysis to attempt to reconstruct lyrical book for each of the four albums failed. Due to the extreme similarity in words among three of the four albums, I was only able to successfully identify which words and tracks belonged to The Payback. I was least successfuly in compiling The Lonesome Crowded West and The Human Romance.
